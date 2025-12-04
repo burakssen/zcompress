@@ -214,8 +214,11 @@ pub const Deflate = struct {
 test "Deflate: multithreaded stream roundtrip" {
     const allocator = std.testing.allocator;
 
-    var pool = std.Thread.Pool{ .allocator = allocator };
-    try pool.init(.{ .n_jobs = 4 });
+    var pool: std.Thread.Pool = undefined;
+    try pool.init(.{
+        .allocator = allocator,
+        .n_jobs = 8,
+    });
     defer pool.deinit();
 
     var def = Deflate.init(allocator, &pool, .zlib, .fast);
@@ -231,8 +234,6 @@ test "Deflate: multithreaded stream roundtrip" {
 
     var in_stream: std.Io.Reader = .fixed(big_msg);
     try def.compress(&in_stream, &compressed_out.writer);
-
-    std.debug.print("Compressed size: {d}\n", .{compressed_out.written().len});
 
     var decompressed_out: std.Io.Writer.Allocating = .init(allocator);
     defer decompressed_out.deinit();

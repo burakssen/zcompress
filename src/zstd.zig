@@ -241,12 +241,15 @@ pub const Zstd = struct {
 test "Zstd: multithreaded stream roundtrip" {
     const allocator = std.testing.allocator;
 
-    var pool = std.Thread.Pool{ .allocator = allocator };
-    try pool.init(.{ .n_jobs = 4 });
+    var pool: std.Thread.Pool = undefined;
+    try pool.init(.{
+        .allocator = allocator,
+        .n_jobs = 8,
+    });
     defer pool.deinit();
 
     // Init Zstd instead of Deflate
-    var zs = Zstd.init(allocator, &pool, .fast);
+    var zs = Zstd.init(allocator, &pool, .ultra);
     defer zs.deinit();
 
     const large_size = 20 * 1024 * 1024;
@@ -260,8 +263,6 @@ test "Zstd: multithreaded stream roundtrip" {
 
     var in_stream: std.Io.Reader = .fixed(big_msg);
     try zs.compress(&in_stream, &compressed_out.writer);
-
-    std.debug.print("Zstd Compressed size: {d}\n", .{compressed_out.written().len});
 
     var decompressed_out: std.Io.Writer.Allocating = .init(allocator);
     defer decompressed_out.deinit();

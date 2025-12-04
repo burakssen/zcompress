@@ -53,4 +53,5 @@ pub const Decompressor = struct {
 
 test {
     _ = Deflate;
+    _ = Zstd;
 }

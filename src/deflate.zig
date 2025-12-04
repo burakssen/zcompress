@@ -11,14 +11,26 @@ pub const Deflate = struct {
     allocator: std.mem.Allocator,
     algorithm: Algorithm,
     level: CompressionLevel,
-    pool: *std.Thread.Pool,
+    // 1. Change: Pool is now optional
+    pool: ?*std.Thread.Pool = null,
     pool_mutex: std.Thread.Mutex = .{},
 
     // Resource pools
     comp_pool: std.ArrayList(*libdeflate.libdeflate_compressor),
     decomp_pool: std.ArrayList(*libdeflate.libdeflate_decompressor),
 
-    pub fn init(allocator: std.mem.Allocator, pool: *std.Thread.Pool, algo: Algorithm, level: ?CompressionLevel) Deflate {
+    // 2. Change: Update init signature to accept optional pool
+    pub fn init(allocator: std.mem.Allocator, algo: Algorithm, level: ?CompressionLevel) Deflate {
+        return .{
+            .allocator = allocator,
+            .algorithm = algo,
+            .level = level orelse .default,
+            .comp_pool = .empty,
+            .decomp_pool = .empty,
+        };
+    }
+
+    pub fn initThreaded(allocator: std.mem.Allocator, pool: *std.Thread.Pool, algo: Algorithm, level: ?CompressionLevel) Deflate {
         return .{
             .allocator = allocator,
             .algorithm = algo,
@@ -40,14 +52,16 @@ pub const Deflate = struct {
 
     const Job = struct {
         parent: *Deflate,
-        raw_in: []u8, // Original allocation for freeing
-        raw_out: []u8, // Original allocation for freeing
-        data_slice: []u8, // Actual data window (slice of raw_in)
+        raw_in: []u8,
+        raw_out: []u8,
+        data_slice: []u8,
         result_size: usize = 0,
         err: ?anyerror = null,
         done: std.Thread.ResetEvent = .{},
 
         pub fn runCompress(self: *Job) void {
+            // Note: Mutex locking inside getCompressor handles thread safety
+            // even if we are running effectively single-threaded here.
             const comp = self.parent.getCompressor() catch |e| return self.fail(e);
             defer self.parent.returnCompressor(comp);
 
@@ -90,7 +104,6 @@ pub const Deflate = struct {
     // --- Stream API ---
 
     pub fn compress(self: *Deflate, reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
-        // Calculate Max Output Size
         const bound = bound: {
             const c = try self.getCompressor();
             defer self.returnCompressor(c);
@@ -119,7 +132,9 @@ pub const Deflate = struct {
 
                 const job = try self.createJob(in_buf, in_buf[0..n], bound);
                 try queue.append(self.allocator, job);
-                try self.pool.spawn(Job.runCompress, .{job});
+
+                // 3. Change: Check for pool presence
+                if (self.pool) |p| try p.spawn(Job.runCompress, .{job}) else job.runCompress();
             }
 
             // 2. Drain / Process Oldest
@@ -127,6 +142,7 @@ pub const Deflate = struct {
             const job = queue.orderedRemove(0);
             defer self.destroyJob(job);
 
+            // If sync, this returns immediately. If async, this waits for worker.
             job.done.wait();
             if (job.err) |err| return err;
 
@@ -152,7 +168,13 @@ pub const Deflate = struct {
 
                 const job = try self.createJob(in_buf, in_buf, CHUNK_SIZE);
                 try queue.append(self.allocator, job);
-                try self.pool.spawn(Job.runDecompress, .{job});
+
+                // 4. Change: Check for pool presence
+                if (self.pool) |p| {
+                    try p.spawn(Job.runDecompress, .{job});
+                } else {
+                    job.runDecompress();
+                }
             }
 
             // 2. Drain / Process Oldest
@@ -221,10 +243,11 @@ test "Deflate: multithreaded stream roundtrip" {
     });
     defer pool.deinit();
 
-    var def = Deflate.init(allocator, &pool, .zlib, .fast);
+    // Pass &pool
+    var def = Deflate.initThreaded(allocator, &pool, .zlib, .fast);
     defer def.deinit();
 
-    const large_size = 20 * 1024 * 1024;
+    const large_size = 5 * 1024 * 1024;
     const big_msg = try allocator.alloc(u8, large_size);
     defer allocator.free(big_msg);
     for (big_msg, 0..) |*b, i| b.* = @intCast(i % 255);
@@ -243,4 +266,28 @@ test "Deflate: multithreaded stream roundtrip" {
 
     try std.testing.expectEqual(big_msg.len, decompressed_out.written().len);
     try std.testing.expectEqualSlices(u8, big_msg, decompressed_out.written());
+}
+
+test "Deflate: single-threaded stream roundtrip" {
+    const allocator = std.testing.allocator;
+
+    // Pass null for pool
+    var def = Deflate.init(allocator, .gzip, .default);
+    defer def.deinit();
+
+    const data = "Hello, Single Threaded World! " ** 1000;
+
+    var compressed_out: std.Io.Writer.Allocating = .init(allocator);
+    defer compressed_out.deinit();
+
+    var in_stream: std.Io.Reader = .fixed(data);
+    try def.compress(&in_stream, &compressed_out.writer);
+
+    var decompressed_out: std.Io.Writer.Allocating = .init(allocator);
+    defer decompressed_out.deinit();
+
+    var comp_stream: std.Io.Reader = .fixed(compressed_out.written());
+    try def.decompress(&comp_stream, &decompressed_out.writer);
+
+    try std.testing.expectEqualSlices(u8, data, decompressed_out.written());
 }

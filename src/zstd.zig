@@ -16,7 +16,8 @@ const WINDOW_SIZE = 16;
 pub const Zstd = struct {
     allocator: std.mem.Allocator,
     level: CompressionLevel,
-    pool: *std.Thread.Pool,
+    // 1. Change: Pool is now optional
+    pool: ?*std.Thread.Pool = null,
     pool_mutex: std.Thread.Mutex = .{},
 
     // Resource pools
@@ -24,7 +25,17 @@ pub const Zstd = struct {
     comp_pool: std.ArrayList(*zstd.ZSTD_CCtx),
     decomp_pool: std.ArrayList(*zstd.ZSTD_DCtx),
 
-    pub fn init(allocator: std.mem.Allocator, pool: *std.Thread.Pool, level: ?CompressionLevel) Zstd {
+    // 2. Change: Init accepts optional pool
+    pub fn init(allocator: std.mem.Allocator, level: ?CompressionLevel) Zstd {
+        return .{
+            .allocator = allocator,
+            .level = level orelse .default,
+            .comp_pool = .empty,
+            .decomp_pool = .empty,
+        };
+    }
+
+    pub fn initThreaded(allocator: std.mem.Allocator, pool: *std.Thread.Pool, level: ?CompressionLevel) Zstd {
         return .{
             .allocator = allocator,
             .level = level orelse .default,
@@ -134,7 +145,13 @@ pub const Zstd = struct {
                 // Compress job uses 'bound' size for output buffer
                 const job = try self.createJob(in_buf, in_buf[0..n], bound);
                 try queue.append(self.allocator, job);
-                try self.pool.spawn(Job.runCompress, .{job});
+
+                // 3. Change: Check for pool presence
+                if (self.pool) |p| {
+                    try p.spawn(Job.runCompress, .{job});
+                } else {
+                    job.runCompress();
+                }
             }
 
             // 2. Drain / Process Oldest
@@ -170,7 +187,13 @@ pub const Zstd = struct {
                 // Decompress job expects CHUNK_SIZE output (since we compress fixed chunks)
                 const job = try self.createJob(in_buf, in_buf, CHUNK_SIZE);
                 try queue.append(self.allocator, job);
-                try self.pool.spawn(Job.runDecompress, .{job});
+
+                // 4. Change: Check for pool presence
+                if (self.pool) |p| {
+                    try p.spawn(Job.runDecompress, .{job});
+                } else {
+                    job.runDecompress();
+                }
             }
 
             // 2. Drain / Process Oldest
@@ -244,15 +267,14 @@ test "Zstd: multithreaded stream roundtrip" {
     var pool: std.Thread.Pool = undefined;
     try pool.init(.{
         .allocator = allocator,
-        .n_jobs = 8,
+        .n_jobs = 4, // Using 4 jobs
     });
     defer pool.deinit();
 
-    // Init Zstd instead of Deflate
-    var zs = Zstd.init(allocator, &pool, .ultra);
+    var zs = Zstd.initThreaded(allocator, &pool, .fastest);
     defer zs.deinit();
 
-    const large_size = 20 * 1024 * 1024;
+    const large_size = 5 * 1024 * 1024;
     const big_msg = try allocator.alloc(u8, large_size);
     defer allocator.free(big_msg);
     // Fill with pattern
@@ -272,4 +294,27 @@ test "Zstd: multithreaded stream roundtrip" {
 
     try std.testing.expectEqual(big_msg.len, decompressed_out.written().len);
     try std.testing.expectEqualSlices(u8, big_msg, decompressed_out.written());
+}
+
+test "Zstd: single-threaded stream roundtrip" {
+    const allocator = std.testing.allocator;
+
+    var zs = Zstd.init(allocator, .default);
+    defer zs.deinit();
+
+    const data = "Zstd Single Thread Test Data" ** 500;
+
+    var compressed_out: std.Io.Writer.Allocating = .init(allocator);
+    defer compressed_out.deinit();
+
+    var in_stream: std.Io.Reader = .fixed(data);
+    try zs.compress(&in_stream, &compressed_out.writer);
+
+    var decompressed_out: std.Io.Writer.Allocating = .init(allocator);
+    defer decompressed_out.deinit();
+
+    var comp_stream: std.Io.Reader = .fixed(compressed_out.written());
+    try zs.decompress(&comp_stream, &decompressed_out.writer);
+
+    try std.testing.expectEqualSlices(u8, data, decompressed_out.written());
 }

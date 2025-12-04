@@ -15,20 +15,30 @@ pub fn main() !void {
         .n_jobs = 8,
     });
     defer pool.deinit();
-    var deflate = zc.Deflate.init(allocator, &pool, .zlib, .fast);
+    var deflate = zc.Deflate.init(allocator, .zlib, .fast);
     defer deflate.deinit();
-    var zstd = zc.Zstd.init(allocator, &pool, .best);
+    var deflate_threaded = zc.Deflate.initThreaded(allocator, &pool, .zlib, .fast);
+    defer deflate_threaded.deinit();
+    var zstd = zc.Zstd.init(allocator, .best);
     defer zstd.deinit();
+    var zstd_threaded = zc.Zstd.initThreaded(allocator, &pool, .best);
+    defer zstd_threaded.deinit();
 
     var deflate_compressor = zc.Compressor.init(&deflate);
     var deflate_decompressor = zc.Decompressor.init(&deflate);
+    var deflate_threaded_compressor = zc.Compressor.init(&deflate_threaded);
+    var deflate_threaded_decompressor = zc.Decompressor.init(&deflate_threaded);
 
     var zstd_compressor = zc.Compressor.init(&zstd);
     var zstd_decompressor = zc.Decompressor.init(&zstd);
+    var zstd_threaded_compressor = zc.Compressor.init(&zstd_threaded);
+    var zstd_threaded_decompressor = zc.Decompressor.init(&zstd_threaded);
 
     inline for (&.{
         .{ .name = "Deflate", .compressor = &deflate_compressor, .decompressor = &deflate_decompressor },
+        .{ .name = "Deflate Threaded", .compressor = &deflate_threaded_compressor, .decompressor = &deflate_threaded_decompressor },
         .{ .name = "Zstd", .compressor = &zstd_compressor, .decompressor = &zstd_decompressor },
+        .{ .name = "Zstd Threaded", .compressor = &zstd_threaded_compressor, .decompressor = &zstd_threaded_decompressor },
     }) |tc| {
         std.log.debug("=== Testing {s} ===", .{tc.name});
         try test_compress(tc.compressor, tc.decompressor);
@@ -105,9 +115,9 @@ fn createDummyInput(_: std.mem.Allocator) !void {
     defer file.close();
 
     // Create 5MB of repeated text
-    const text = "This is a test line for zig compression testing.\n";
+    const text = "The quick brown fox jumps over the lazy dog. " ** 1024;
     var i: usize = 0;
-    while (i < 100_000) : (i += 1) {
-        _ = try file.write(text);
+    while (i < 100 * 1024 * 1024) : (i += text.len) {
+        try file.writeAll(text);
     }
 }

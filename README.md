@@ -34,7 +34,7 @@ exe.addModule("zcompress", zcompress.module("zcompress"));
 
 Here's a simple example of how to use `zcompress` to compress and decompress data with Deflate:
 
-```zig
+````zig
 const std = @import("std");
 const zc = @import("zcompress");
 
@@ -63,4 +63,4 @@ To build the project and run the tests, use the following command:
 
 ```sh
 zig build test
-```
+````

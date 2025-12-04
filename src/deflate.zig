@@ -4,257 +4,242 @@ const libdeflate = @cImport(@cInclude("libdeflate.h"));
 const Algorithm = enum { deflate, gzip, zlib };
 const CompressionLevel = enum(u8) { fastest = 1, fast = 3, default = 6, good = 9, best = 12 };
 
+const CHUNK_SIZE = 64 * 1024;
+const WINDOW_SIZE = 16;
+
 pub const Deflate = struct {
     allocator: std.mem.Allocator,
     algorithm: Algorithm,
     level: CompressionLevel,
+    pool: *std.Thread.Pool,
+    pool_mutex: std.Thread.Mutex = .{},
 
-    pub fn init(allocator: std.mem.Allocator, algorithm: Algorithm, level: ?CompressionLevel) Deflate {
-        return .{ .allocator = allocator, .algorithm = algorithm, .level = level orelse .default };
-    }
+    // Resource pools
+    comp_pool: std.ArrayList(*libdeflate.libdeflate_compressor),
+    decomp_pool: std.ArrayList(*libdeflate.libdeflate_decompressor),
 
-    fn getBound(self: *Deflate, compressor: ?*libdeflate.libdeflate_compressor, len: usize) usize {
-        return switch (self.algorithm) {
-            .deflate => libdeflate.libdeflate_deflate_compress_bound(compressor, len),
-            .gzip => libdeflate.libdeflate_gzip_compress_bound(compressor, len),
-            .zlib => libdeflate.libdeflate_zlib_compress_bound(compressor, len),
+    pub fn init(allocator: std.mem.Allocator, pool: *std.Thread.Pool, algo: Algorithm, level: ?CompressionLevel) Deflate {
+        return .{
+            .allocator = allocator,
+            .algorithm = algo,
+            .level = level orelse .default,
+            .pool = pool,
+            .comp_pool = .empty,
+            .decomp_pool = .empty,
         };
     }
 
-    fn compressData(self: *Deflate, compressor: ?*libdeflate.libdeflate_compressor, in: []const u8, out: []u8) usize {
-        return switch (self.algorithm) {
-            .deflate => libdeflate.libdeflate_deflate_compress(compressor, in.ptr, in.len, out.ptr, out.len),
-            .gzip => libdeflate.libdeflate_gzip_compress(compressor, in.ptr, in.len, out.ptr, out.len),
-            .zlib => libdeflate.libdeflate_zlib_compress(compressor, in.ptr, in.len, out.ptr, out.len),
-        };
+    pub fn deinit(self: *Deflate) void {
+        while (self.comp_pool.pop()) |c| libdeflate.libdeflate_free_compressor(c);
+        while (self.decomp_pool.pop()) |d| libdeflate.libdeflate_free_decompressor(d);
+        self.comp_pool.deinit(self.allocator);
+        self.decomp_pool.deinit(self.allocator);
     }
 
-    fn decompressData(self: *Deflate, decompressor: ?*libdeflate.libdeflate_decompressor, in: []const u8, out: []u8, actual: *usize) usize {
-        return switch (self.algorithm) {
-            .deflate => libdeflate.libdeflate_deflate_decompress(decompressor, in.ptr, in.len, out.ptr, out.len, actual),
-            .gzip => libdeflate.libdeflate_gzip_decompress(decompressor, in.ptr, in.len, out.ptr, out.len, actual),
-            .zlib => libdeflate.libdeflate_zlib_decompress(decompressor, in.ptr, in.len, out.ptr, out.len, actual),
-        };
-    }
+    // --- Unified Job Context ---
 
-    pub fn compress(self: *Deflate, input: []const u8) ![]u8 {
-        const compressor = libdeflate.libdeflate_alloc_compressor(@intFromEnum(self.level)) orelse return error.CompressorAllocationFailed;
-        defer libdeflate.libdeflate_free_compressor(compressor);
+    const Job = struct {
+        parent: *Deflate,
+        raw_in: []u8, // Original allocation for freeing
+        raw_out: []u8, // Original allocation for freeing
+        data_slice: []u8, // Actual data window (slice of raw_in)
+        result_size: usize = 0,
+        err: ?anyerror = null,
+        done: std.Thread.ResetEvent = .{},
 
-        const bound = self.getBound(compressor, input.len);
-        const output = try self.allocator.alloc(u8, bound);
-        errdefer self.allocator.free(output);
+        pub fn runCompress(self: *Job) void {
+            const comp = self.parent.getCompressor() catch |e| return self.fail(e);
+            defer self.parent.returnCompressor(comp);
 
-        const compressed_size = self.compressData(compressor, input, output);
-        return try self.allocator.realloc(output, compressed_size);
-    }
+            const src = self.data_slice;
+            const dest = self.raw_out;
 
-    pub fn decompress(self: *Deflate, input: []const u8) ![]u8 {
-        const decompressor = libdeflate.libdeflate_alloc_decompressor() orelse return error.DecompressorAllocationFailed;
-        defer libdeflate.libdeflate_free_decompressor(decompressor);
+            const size = switch (self.parent.algorithm) {
+                .deflate => libdeflate.libdeflate_deflate_compress(comp, src.ptr, src.len, dest.ptr, dest.len),
+                .gzip => libdeflate.libdeflate_gzip_compress(comp, src.ptr, src.len, dest.ptr, dest.len),
+                .zlib => libdeflate.libdeflate_zlib_compress(comp, src.ptr, src.len, dest.ptr, dest.len),
+            };
 
-        var output_size = input.len * 2;
-        var output = try self.allocator.alloc(u8, output_size);
-
-        // errdefer runs only when the function unwinds due to an error,
-        // so it will free `output` automatically on error returns.
-        errdefer self.allocator.free(output);
-
-        var actual_size: usize = undefined;
-
-        while (true) {
-            switch (self.decompressData(decompressor, input, output[0..output_size], &actual_size)) {
-                libdeflate.LIBDEFLATE_SUCCESS => {
-                    return try self.allocator.realloc(output, actual_size);
-                },
-                libdeflate.LIBDEFLATE_BAD_DATA => {
-                    return error.BadData;
-                },
-                libdeflate.LIBDEFLATE_SHORT_OUTPUT => {
-                    const new_size = output_size + output_size / 2;
-                    if (new_size > 1024 * 1024 * 1024) {
-                        return error.DecompressionTooLarge;
-                    }
-                    output = try self.allocator.realloc(output, new_size);
-                    output_size = new_size;
-                },
-                libdeflate.LIBDEFLATE_INSUFFICIENT_SPACE => {
-                    const new_size = output_size + output_size / 2;
-                    if (new_size > 1024 * 1024 * 1024) {
-                        return error.DecompressionTooLarge;
-                    }
-                    output = try self.allocator.realloc(output, new_size);
-                    output_size = new_size;
-                },
-                else => {
-                    // errdefer frees `output`
-                    return error.UnknownDecompressionError;
-                },
-            }
+            if (size == 0) self.err = error.CompressionFailed;
+            self.result_size = size;
+            self.done.set();
         }
+
+        pub fn runDecompress(self: *Job) void {
+            const decomp = self.parent.getDecompressor() catch |e| return self.fail(e);
+            defer self.parent.returnDecompressor(decomp);
+
+            var actual: usize = 0;
+            const res = switch (self.parent.algorithm) {
+                .deflate => libdeflate.libdeflate_deflate_decompress(decomp, self.data_slice.ptr, self.data_slice.len, self.raw_out.ptr, self.raw_out.len, &actual),
+                .gzip => libdeflate.libdeflate_gzip_decompress(decomp, self.data_slice.ptr, self.data_slice.len, self.raw_out.ptr, self.raw_out.len, &actual),
+                .zlib => libdeflate.libdeflate_zlib_decompress(decomp, self.data_slice.ptr, self.data_slice.len, self.raw_out.ptr, self.raw_out.len, &actual),
+            };
+
+            if (res != libdeflate.LIBDEFLATE_SUCCESS) self.err = error.BadData;
+            self.result_size = actual;
+            self.done.set();
+        }
+
+        fn fail(self: *Job, err: anyerror) void {
+            self.err = err;
+            self.done.set();
+        }
+    };
+
+    // --- Stream API ---
+
+    pub fn compress(self: *Deflate, reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
+        // Calculate Max Output Size
+        const bound = bound: {
+            const c = try self.getCompressor();
+            defer self.returnCompressor(c);
+            break :bound switch (self.algorithm) {
+                .deflate => libdeflate.libdeflate_deflate_compress_bound(c, CHUNK_SIZE),
+                .gzip => libdeflate.libdeflate_gzip_compress_bound(c, CHUNK_SIZE),
+                .zlib => libdeflate.libdeflate_zlib_compress_bound(c, CHUNK_SIZE),
+            };
+        };
+
+        var queue: std.ArrayList(*Job) = .empty;
+        defer queue.deinit(self.allocator);
+
+        var eof = false;
+        while (true) {
+            // 1. Fill Pipeline
+            while (queue.items.len < WINDOW_SIZE and !eof) {
+                const in_buf = try self.allocator.alloc(u8, CHUNK_SIZE);
+                errdefer self.allocator.free(in_buf);
+                const n = try reader.readSliceShort(in_buf);
+                if (n == 0) {
+                    self.allocator.free(in_buf);
+                    eof = true;
+                    break;
+                }
+
+                const job = try self.createJob(in_buf, in_buf[0..n], bound);
+                try queue.append(self.allocator, job);
+                try self.pool.spawn(Job.runCompress, .{job});
+            }
+
+            // 2. Drain / Process Oldest
+            if (queue.items.len == 0 and eof) break;
+            const job = queue.orderedRemove(0);
+            defer self.destroyJob(job);
+
+            job.done.wait();
+            if (job.err) |err| return err;
+
+            try writer.writeInt(u32, @intCast(job.result_size), .little);
+            try writer.writeAll(job.raw_out[0..job.result_size]);
+        }
+    }
+
+    pub fn decompress(self: *Deflate, reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
+        var queue: std.ArrayList(*Job) = .empty;
+        defer queue.deinit(self.allocator);
+
+        var eof = false;
+        while (true) {
+            // 1. Fill Pipeline
+            while (queue.items.len < WINDOW_SIZE and !eof) {
+                const len = reader.takeInt(u32, .little) catch |e| if (e == error.EndOfStream) {
+                    eof = true;
+                    break;
+                } else return e;
+                const in_buf = try self.allocator.alloc(u8, len);
+                try reader.readSliceAll(in_buf);
+
+                const job = try self.createJob(in_buf, in_buf, CHUNK_SIZE);
+                try queue.append(self.allocator, job);
+                try self.pool.spawn(Job.runDecompress, .{job});
+            }
+
+            // 2. Drain / Process Oldest
+            if (queue.items.len == 0 and eof) break;
+            const job = queue.orderedRemove(0);
+            defer self.destroyJob(job);
+
+            job.done.wait();
+            if (job.err) |err| return err;
+
+            try writer.writeAll(job.raw_out[0..job.result_size]);
+        }
+    }
+
+    // --- Helpers ---
+
+    fn createJob(self: *Deflate, raw_in: []u8, data: []u8, out_cap: usize) !*Job {
+        const out_buf = try self.allocator.alloc(u8, out_cap);
+        const job = try self.allocator.create(Job);
+        job.* = .{ .parent = self, .raw_in = raw_in, .data_slice = data, .raw_out = out_buf };
+        return job;
+    }
+
+    fn destroyJob(self: *Deflate, job: *Job) void {
+        self.allocator.free(job.raw_in);
+        self.allocator.free(job.raw_out);
+        self.allocator.destroy(job);
+    }
+
+    fn getCompressor(self: *Deflate) !*libdeflate.libdeflate_compressor {
+        self.pool_mutex.lock();
+        defer self.pool_mutex.unlock();
+        if (self.comp_pool.pop()) |c| return c;
+        return libdeflate.libdeflate_alloc_compressor(@intFromEnum(self.level)) orelse error.CompressorAllocationFailed;
+    }
+
+    fn returnCompressor(self: *Deflate, c: *libdeflate.libdeflate_compressor) void {
+        self.pool_mutex.lock();
+        defer self.pool_mutex.unlock();
+        self.comp_pool.append(self.allocator, c) catch libdeflate.libdeflate_free_compressor(c);
+    }
+
+    fn getDecompressor(self: *Deflate) !*libdeflate.libdeflate_decompressor {
+        self.pool_mutex.lock();
+        defer self.pool_mutex.unlock();
+        if (self.decomp_pool.pop()) |d| return d;
+        return libdeflate.libdeflate_alloc_decompressor() orelse error.DecompressorAllocationFailed;
+    }
+
+    fn returnDecompressor(self: *Deflate, d: *libdeflate.libdeflate_decompressor) void {
+        self.pool_mutex.lock();
+        defer self.pool_mutex.unlock();
+        self.decomp_pool.append(self.allocator, d) catch libdeflate.libdeflate_free_decompressor(d);
     }
 };
 
-test "Deflate: roundtrip compression/decompression (deflate, gzip, zlib)" {
+// --- Tests ---
+
+test "Deflate: multithreaded stream roundtrip" {
     const allocator = std.testing.allocator;
 
-    const input = "The quick brown fox jumps over the lazy dog. This is a test of libdeflate bindings in Zig.";
+    var pool = std.Thread.Pool{ .allocator = allocator };
+    try pool.init(.{ .n_jobs = 4 });
+    defer pool.deinit();
 
-    inline for (.{
-        Algorithm.deflate,
-        Algorithm.gzip,
-        Algorithm.zlib,
-    }) |algo| {
-        var def = Deflate.init(allocator, algo, .default);
+    var def = Deflate.init(allocator, &pool, .zlib, .fast);
+    defer def.deinit();
 
-        const compressed = try def.compress(input);
-        defer allocator.free(compressed);
+    const large_size = 20 * 1024 * 1024;
+    const big_msg = try allocator.alloc(u8, large_size);
+    defer allocator.free(big_msg);
+    for (big_msg, 0..) |*b, i| b.* = @intCast(i % 255);
 
-        const decompressed = try def.decompress(compressed);
-        defer allocator.free(decompressed);
+    var compressed_out: std.Io.Writer.Allocating = .init(allocator);
+    defer compressed_out.deinit();
 
-        try std.testing.expectEqualSlices(u8, input, decompressed);
-    }
-}
+    var in_stream: std.Io.Reader = .fixed(big_msg);
+    try def.compress(&in_stream, &compressed_out.writer);
 
-test "Deflate: compression works with different levels" {
-    const allocator = std.testing.allocator;
-    const input = "Zig test for compression level check. This should compress fine.";
+    std.debug.print("Compressed size: {d}\n", .{compressed_out.written().len});
 
-    inline for (.{
-        CompressionLevel.fastest,
-        CompressionLevel.fast,
-        CompressionLevel.default,
-        CompressionLevel.good,
-        CompressionLevel.best,
-    }) |level| {
-        var def = Deflate.init(allocator, .gzip, level);
-        const compressed = try def.compress(input);
-        defer allocator.free(compressed);
+    var decompressed_out: std.Io.Writer.Allocating = .init(allocator);
+    defer decompressed_out.deinit();
 
-        try std.testing.expect(compressed.len > 0);
-    }
-}
+    var comp_stream: std.Io.Reader = .fixed(compressed_out.written());
+    try def.decompress(&comp_stream, &decompressed_out.writer);
 
-test "Deflate: decompressing bad data fails" {
-    const allocator = std.testing.allocator;
-    var def = Deflate.init(allocator, .gzip, .default);
-
-    const bad_data = "this is not compressed data!";
-    const result = def.decompress(bad_data);
-
-    try std.testing.expectError(error.BadData, result);
-}
-
-test "Deflate: compress and decompress empty input" {
-    const allocator = std.testing.allocator;
-
-    inline for (.{
-        Algorithm.deflate,
-        Algorithm.gzip,
-        Algorithm.zlib,
-    }) |algo| {
-        var def = Deflate.init(allocator, algo, .default);
-        const input: []const u8 = "";
-
-        const compressed = try def.compress(input);
-        defer allocator.free(compressed);
-
-        const decompressed = try def.decompress(compressed);
-        defer allocator.free(decompressed);
-
-        try std.testing.expectEqualSlices(u8, input, decompressed);
-    }
-}
-
-test "Deflate: large data compression roundtrip" {
-    const allocator = std.testing.allocator;
-    const size: usize = 64 * 1024; // 64KB
-    const buf = try allocator.alloc(u8, size);
-    defer allocator.free(buf);
-
-    // Fill buffer with patterned data
-    for (buf, 0..) |*b, i| b.* = @as(u8, @intCast(i % 256));
-
-    var def = Deflate.init(allocator, .zlib, .good);
-
-    const compressed = try def.compress(buf);
-    defer allocator.free(compressed);
-
-    const decompressed = try def.decompress(compressed);
-    defer allocator.free(decompressed);
-
-    try std.testing.expectEqualSlices(u8, buf, decompressed);
-}
-
-test "Deflate: truncated compressed data triggers BadData" {
-    const allocator = std.testing.allocator;
-    var def = Deflate.init(allocator, .deflate, .default);
-
-    const input = "Hello world, this will be truncated.";
-    const compressed = try def.compress(input);
-    defer allocator.free(compressed);
-
-    // Truncate compressed data to simulate corruption
-    const half = compressed[0 .. compressed.len / 2];
-    const result = def.decompress(half);
-
-    try std.testing.expectError(error.BadData, result);
-}
-
-test "Deflate: handles repeated decompression growth (INSUFFICIENT_SPACE path)" {
-    const allocator = std.testing.allocator;
-    var def = Deflate.init(allocator, .gzip, .default);
-
-    // Create a large repetitive string that expands when decompressed
-    const input = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    const compressed = try def.compress(input);
-    defer allocator.free(compressed);
-
-    // Artificially shrink decompression buffer to force realloc growth
-    const decompressor = libdeflate.libdeflate_alloc_decompressor().?;
-    defer libdeflate.libdeflate_free_decompressor(decompressor);
-
-    const output_size: usize = 4; // deliberately tiny to trigger realloc loop
-    const output = try allocator.alloc(u8, output_size);
-    errdefer allocator.free(output);
-
-    var actual_size: usize = undefined;
-
-    switch (def.decompressData(decompressor, compressed, output, &actual_size)) {
-        libdeflate.LIBDEFLATE_INSUFFICIENT_SPACE, libdeflate.LIBDEFLATE_SHORT_OUTPUT => {
-            // expected behavior: buffer too small
-            try std.testing.expect(true);
-        },
-        else => |code| {
-            std.debug.print("Unexpected code: {}\n", .{code});
-            try std.testing.expect(false);
-        },
-    }
-
-    allocator.free(output);
-}
-
-test "Deflate: all algorithms and levels cross test" {
-    const allocator = std.testing.allocator;
-    const input = "Cross testing all algorithms and compression levels.";
-
-    inline for (.{ Algorithm.deflate, Algorithm.gzip, Algorithm.zlib }) |algo| {
-        inline for (.{
-            CompressionLevel.fastest,
-            CompressionLevel.fast,
-            CompressionLevel.default,
-            CompressionLevel.good,
-            CompressionLevel.best,
-        }) |level| {
-            var def = Deflate.init(allocator, algo, level);
-            const compressed = try def.compress(input);
-            defer allocator.free(compressed);
-
-            const decompressed = try def.decompress(compressed);
-            defer allocator.free(decompressed);
-
-            try std.testing.expectEqualSlices(u8, input, decompressed);
-        }
-    }
+    try std.testing.expectEqual(big_msg.len, decompressed_out.written().len);
+    try std.testing.expectEqualSlices(u8, big_msg, decompressed_out.written());
 }

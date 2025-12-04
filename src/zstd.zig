@@ -1,247 +1,274 @@
 const std = @import("std");
 const zstd = @cImport(@cInclude("zstd.h"));
 
-pub const CompressionLevel = enum(i32) {
+pub const CompressionLevel = enum(c_int) {
     fastest = 1,
-    fast = 3,
+    default = 3,
     good = 9,
     best = 19,
-    ultra = 22, // Max with --ultra flag
-
-    pub fn toInt(self: CompressionLevel) i32 {
-        return @intFromEnum(self);
-    }
+    ultra = 22,
 };
+
+const CHUNK_SIZE = 64 * 1024;
+// Zstd contexts are larger than deflate, so we might want to keep window tighter or same.
+const WINDOW_SIZE = 16;
 
 pub const Zstd = struct {
     allocator: std.mem.Allocator,
     level: CompressionLevel,
+    pool: *std.Thread.Pool,
+    pool_mutex: std.Thread.Mutex = .{},
 
-    pub fn init(allocator: std.mem.Allocator, level: ?CompressionLevel) Zstd {
+    // Resource pools
+    // Zstd uses CCtx (Compression Context) and DCtx (Decompression Context)
+    comp_pool: std.ArrayList(*zstd.ZSTD_CCtx),
+    decomp_pool: std.ArrayList(*zstd.ZSTD_DCtx),
+
+    pub fn init(allocator: std.mem.Allocator, pool: *std.Thread.Pool, level: ?CompressionLevel) Zstd {
         return .{
             .allocator = allocator,
-            .level = level orelse .fast,
+            .level = level orelse .default,
+            .pool = pool,
+            .comp_pool = .empty,
+            .decomp_pool = .empty,
         };
     }
 
-    pub fn compress(self: *Zstd, input: []const u8) ![]u8 {
-        const bound = zstd.ZSTD_compressBound(input.len);
-        const output = try self.allocator.alloc(u8, bound);
-        errdefer self.allocator.free(output);
-
-        const compressed_size = zstd.ZSTD_compress(
-            output.ptr,
-            output.len,
-            input.ptr,
-            input.len,
-            self.level.toInt(),
-        );
-
-        if (zstd.ZSTD_isError(compressed_size) != 0) {
-            const err_name = zstd.ZSTD_getErrorName(compressed_size);
-            std.log.err("ZSTD compression error: {s}", .{err_name});
-            self.allocator.free(output);
-            return error.CompressionFailed;
-        }
-
-        return try self.allocator.realloc(output, compressed_size);
+    pub fn deinit(self: *Zstd) void {
+        while (self.comp_pool.pop()) |c| _ = zstd.ZSTD_freeCCtx(c);
+        while (self.decomp_pool.pop()) |d| _ = zstd.ZSTD_freeDCtx(d);
+        self.comp_pool.deinit(self.allocator);
+        self.decomp_pool.deinit(self.allocator);
     }
 
-    pub fn decompress(self: *Zstd, input: []const u8) ![]u8 {
-        // Get the decompressed size from the frame header
-        const decompressed_size = zstd.ZSTD_getFrameContentSize(input.ptr, input.len);
+    // --- Unified Job Context ---
 
-        // ZSTD_CONTENTSIZE_ERROR is (unsigned long long)-2
-        // ZSTD_CONTENTSIZE_UNKNOWN is (unsigned long long)-1
-        const CONTENTSIZE_ERROR: c_ulonglong = @bitCast(@as(c_longlong, -2));
-        const CONTENTSIZE_UNKNOWN: c_ulonglong = @bitCast(@as(c_longlong, -1));
+    const Job = struct {
+        parent: *Zstd,
+        raw_in: []u8, // Original allocation for freeing
+        raw_out: []u8, // Original allocation for freeing
+        data_slice: []u8, // Actual data window (slice of raw_in)
+        result_size: usize = 0,
+        err: ?anyerror = null,
+        done: std.Thread.ResetEvent = .{},
 
-        if (decompressed_size == CONTENTSIZE_ERROR) {
-            return error.InvalidFrameHeader;
-        }
+        pub fn runCompress(self: *Job) void {
+            const cctx = self.parent.getCCtx() catch |e| return self.fail(e);
+            defer self.parent.returnCCtx(cctx);
 
-        // If size is unknown, use streaming decompression with growing buffer
-        if (decompressed_size == CONTENTSIZE_UNKNOWN) {
-            return self.decompressUnknownSize(input);
-        }
+            const src = self.data_slice;
+            const dest = self.raw_out;
 
-        // Allocate exact size needed
-        const output = try self.allocator.alloc(u8, decompressed_size);
-        errdefer self.allocator.free(output);
-
-        const result = zstd.ZSTD_decompress(
-            output.ptr,
-            output.len,
-            input.ptr,
-            input.len,
-        );
-
-        if (zstd.ZSTD_isError(result) != 0) {
-            const err_name = zstd.ZSTD_getErrorName(result);
-            std.log.err("ZSTD decompression error: {s}", .{err_name});
-            self.allocator.free(output);
-            return error.DecompressionFailed;
-        }
-
-        return output;
-    }
-
-    fn decompressUnknownSize(self: *Zstd, input: []const u8) ![]u8 {
-        var output_size = input.len * 2;
-        var output = try self.allocator.alloc(u8, output_size);
-        errdefer self.allocator.free(output);
-
-        while (true) {
-            const result = zstd.ZSTD_decompress(
-                output.ptr,
-                output_size,
-                input.ptr,
-                input.len,
+            // ZSTD_compressCCtx: Compress src into dest using the context.
+            // It automatically resets the context session.
+            const size = zstd.ZSTD_compressCCtx(
+                cctx,
+                dest.ptr,
+                dest.len,
+                src.ptr,
+                src.len,
+                @intFromEnum(self.parent.level),
             );
 
-            if (zstd.ZSTD_isError(result) == 0) {
-                // Success
-                return try self.allocator.realloc(output, result);
-            }
-
-            const error_code = zstd.ZSTD_getErrorCode(result);
-
-            // Check for buffer too small error (error code 70)
-            if (error_code == @as(c_uint, @intCast(70))) {
-                // Need larger buffer
-                const new_size = output_size + output_size / 2;
-                if (new_size > 1024 * 1024 * 1024) {
-                    self.allocator.free(output);
-                    return error.DecompressionTooLarge;
-                }
-                output = try self.allocator.realloc(output, new_size);
-                output_size = new_size;
+            if (zstd.ZSTD_isError(size) != 0) {
+                // Ideally log error name: zstd.ZSTD_getErrorName(size)
+                self.err = error.CompressionFailed;
             } else {
-                // Other error
-                const err_name = zstd.ZSTD_getErrorName(result);
-                std.log.err("ZSTD decompression error: {s}", .{err_name});
-                self.allocator.free(output);
-                return error.DecompressionFailed;
+                self.result_size = size;
             }
-        }
-    }
-
-    // Streaming compression for large data
-    pub fn compressStream(self: *Zstd, input: []const u8) ![]u8 {
-        const cctx = zstd.ZSTD_createCCtx() orelse return error.ContextCreationFailed;
-        defer _ = zstd.ZSTD_freeCCtx(cctx);
-
-        const bound = zstd.ZSTD_compressBound(input.len);
-        const output = try self.allocator.alloc(u8, bound);
-        errdefer self.allocator.free(output);
-
-        var in_buf = zstd.ZSTD_inBuffer_s{
-            .src = input.ptr,
-            .size = input.len,
-            .pos = 0,
-        };
-
-        var out_buf = zstd.ZSTD_outBuffer_s{
-            .dst = output.ptr,
-            .size = output.len,
-            .pos = 0,
-        };
-
-        _ = zstd.ZSTD_CCtx_setParameter(cctx, zstd.ZSTD_c_compressionLevel, self.level.toInt());
-
-        const remaining = zstd.ZSTD_compressStream2(cctx, &out_buf, &in_buf, zstd.ZSTD_e_end);
-
-        if (zstd.ZSTD_isError(remaining) != 0) {
-            const err_name = zstd.ZSTD_getErrorName(remaining);
-            std.log.err("ZSTD streaming compression error: {s}", .{err_name});
-            self.allocator.free(output);
-            return error.CompressionFailed;
+            self.done.set();
         }
 
-        return try self.allocator.realloc(output, out_buf.pos);
-    }
+        pub fn runDecompress(self: *Job) void {
+            const dctx = self.parent.getDCtx() catch |e| return self.fail(e);
+            defer self.parent.returnDCtx(dctx);
 
-    // Streaming decompression for large data
-    // Streaming decompression for large data
-    pub fn decompressStream(self: *Zstd, input: []const u8) ![]u8 {
-        const dctx = zstd.ZSTD_createDCtx() orelse return error.ContextCreationFailed;
-        defer _ = zstd.ZSTD_freeDCtx(dctx);
+            const src = self.data_slice;
+            const dest = self.raw_out;
 
-        // Try to get the decompressed size hint
-        const size_hint = zstd.ZSTD_getFrameContentSize(input.ptr, input.len);
-        const CONTENTSIZE_ERROR: c_ulonglong = @bitCast(@as(c_longlong, -2));
-        const CONTENTSIZE_UNKNOWN: c_ulonglong = @bitCast(@as(c_longlong, -1));
+            // ZSTD_decompressDCtx: Decompress src into dest using the context.
+            const size = zstd.ZSTD_decompressDCtx(
+                dctx,
+                dest.ptr,
+                dest.len,
+                src.ptr,
+                src.len,
+            );
 
-        // Start with a reasonable size based on hint or fallback
-        var output_size: usize = blk: {
-            if (size_hint != CONTENTSIZE_ERROR and size_hint != CONTENTSIZE_UNKNOWN) {
-                // Use the exact size from the frame header
-                break :blk size_hint;
+            if (zstd.ZSTD_isError(size) != 0) {
+                self.err = error.BadData;
             } else {
-                // Fallback: start with 64x the compressed size (common ratio)
-                const initial = input.len * 64;
-                break :blk @min(initial, 128 * 1024 * 1024); // Cap at 128MB initial
+                self.result_size = size;
             }
-        };
-
-        // Check size limit upfront
-        if (output_size > 2 * 1024 * 1024 * 1024) {
-            return error.DecompressionTooLarge;
+            self.done.set();
         }
 
-        var output = try self.allocator.alloc(u8, output_size);
-        errdefer self.allocator.free(output);
+        fn fail(self: *Job, err: anyerror) void {
+            self.err = err;
+            self.done.set();
+        }
+    };
 
-        var in_buf = zstd.ZSTD_inBuffer_s{
-            .src = input.ptr,
-            .size = input.len,
-            .pos = 0,
-        };
+    // --- Stream API ---
 
-        var out_buf = zstd.ZSTD_outBuffer_s{
-            .dst = output.ptr,
-            .size = output_size,
-            .pos = 0,
-        };
+    pub fn compress(self: *Zstd, reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
+        // Calculate Max Output Size for a single chunk
+        const bound = zstd.ZSTD_compressBound(CHUNK_SIZE);
 
+        var queue: std.ArrayList(*Job) = .empty;
+        defer queue.deinit(self.allocator);
+
+        var eof = false;
         while (true) {
-            // Ensure we have at least 64KB of space before decompressing
-            if (out_buf.size - out_buf.pos < 65536) {
-                const new_size = output_size + @max(output_size / 2, 1024 * 1024);
-
-                // Check limit before attempting reallocation
-                if (new_size > 2 * 1024 * 1024 * 1024) {
-                    self.allocator.free(output);
-                    return error.DecompressionTooLarge;
+            // 1. Fill Pipeline
+            while (queue.items.len < WINDOW_SIZE and !eof) {
+                const in_buf = try self.allocator.alloc(u8, CHUNK_SIZE);
+                errdefer self.allocator.free(in_buf);
+                const n = try reader.readSliceShort(in_buf);
+                if (n == 0) {
+                    self.allocator.free(in_buf);
+                    eof = true;
+                    break;
                 }
 
-                output = try self.allocator.realloc(output, new_size);
-                out_buf.dst = output.ptr;
-                out_buf.size = new_size;
-                output_size = new_size;
+                // Compress job uses 'bound' size for output buffer
+                const job = try self.createJob(in_buf, in_buf[0..n], bound);
+                try queue.append(self.allocator, job);
+                try self.pool.spawn(Job.runCompress, .{job});
             }
 
-            const result = zstd.ZSTD_decompressStream(dctx, &out_buf, &in_buf);
+            // 2. Drain / Process Oldest
+            if (queue.items.len == 0 and eof) break;
+            const job = queue.orderedRemove(0);
+            defer self.destroyJob(job);
 
-            if (zstd.ZSTD_isError(result) != 0) {
-                const err_name = zstd.ZSTD_getErrorName(result);
-                std.log.err("ZSTD streaming decompression error: {s}", .{err_name});
-                self.allocator.free(output);
-                return error.DecompressionFailed;
-            }
+            job.done.wait();
+            if (job.err) |err| return err;
 
-            // result == 0 means the frame is complete
-            if (result == 0) {
-                break;
-            }
-
-            // If we've consumed all input and zstd wants more, we have an incomplete frame
-            if (in_buf.pos >= in_buf.size and result > 0) {
-                self.allocator.free(output);
-                return error.IncompleteFrame;
-            }
+            // Write format: [u32 length][compressed blob]
+            try writer.writeInt(u32, @intCast(job.result_size), .little);
+            try writer.writeAll(job.raw_out[0..job.result_size]);
         }
+    }
 
-        return try self.allocator.realloc(output, out_buf.pos);
+    pub fn decompress(self: *Zstd, reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
+        var queue: std.ArrayList(*Job) = .empty;
+        defer queue.deinit(self.allocator);
+
+        var eof = false;
+        while (true) {
+            // 1. Fill Pipeline
+            while (queue.items.len < WINDOW_SIZE and !eof) {
+                const len = reader.takeInt(u32, .little) catch |e| if (e == error.EndOfStream) {
+                    eof = true;
+                    break;
+                } else return e;
+
+                const in_buf = try self.allocator.alloc(u8, len);
+                try reader.readSliceAll(in_buf);
+
+                // Decompress job expects CHUNK_SIZE output (since we compress fixed chunks)
+                const job = try self.createJob(in_buf, in_buf, CHUNK_SIZE);
+                try queue.append(self.allocator, job);
+                try self.pool.spawn(Job.runDecompress, .{job});
+            }
+
+            // 2. Drain / Process Oldest
+            if (queue.items.len == 0 and eof) break;
+            const job = queue.orderedRemove(0);
+            defer self.destroyJob(job);
+
+            job.done.wait();
+            if (job.err) |err| return err;
+
+            try writer.writeAll(job.raw_out[0..job.result_size]);
+        }
+    }
+
+    // --- Helpers ---
+
+    fn createJob(self: *Zstd, raw_in: []u8, data: []u8, out_cap: usize) !*Job {
+        const out_buf = try self.allocator.alloc(u8, out_cap);
+        const job = try self.allocator.create(Job);
+        job.* = .{ .parent = self, .raw_in = raw_in, .data_slice = data, .raw_out = out_buf };
+        return job;
+    }
+
+    fn destroyJob(self: *Zstd, job: *Job) void {
+        self.allocator.free(job.raw_in);
+        self.allocator.free(job.raw_out);
+        self.allocator.destroy(job);
+    }
+
+    // --- Resource Pooling ---
+
+    fn getCCtx(self: *Zstd) !*zstd.ZSTD_CCtx {
+        self.pool_mutex.lock();
+        defer self.pool_mutex.unlock();
+        if (self.comp_pool.pop()) |c| return c;
+
+        // ZSTD_createCCtx is thread-safe, but we pool it to avoid allocation overhead
+        return zstd.ZSTD_createCCtx() orelse error.CompressorAllocationFailed;
+    }
+
+    fn returnCCtx(self: *Zstd, c: *zstd.ZSTD_CCtx) void {
+        self.pool_mutex.lock();
+        defer self.pool_mutex.unlock();
+        self.comp_pool.append(self.allocator, c) catch {
+            _ = zstd.ZSTD_freeCCtx(c);
+        };
+    }
+
+    fn getDCtx(self: *Zstd) !*zstd.ZSTD_DCtx {
+        self.pool_mutex.lock();
+        defer self.pool_mutex.unlock();
+        if (self.decomp_pool.pop()) |d| return d;
+
+        return zstd.ZSTD_createDCtx() orelse error.DecompressorAllocationFailed;
+    }
+
+    fn returnDCtx(self: *Zstd, d: *zstd.ZSTD_DCtx) void {
+        self.pool_mutex.lock();
+        defer self.pool_mutex.unlock();
+        self.decomp_pool.append(self.allocator, d) catch {
+            _ = zstd.ZSTD_freeDCtx(d);
+        };
     }
 };
+
+// --- Tests ---
+
+test "Zstd: multithreaded stream roundtrip" {
+    const allocator = std.testing.allocator;
+
+    var pool = std.Thread.Pool{ .allocator = allocator };
+    try pool.init(.{ .n_jobs = 4 });
+    defer pool.deinit();
+
+    // Init Zstd instead of Deflate
+    var zs = Zstd.init(allocator, &pool, .fast);
+    defer zs.deinit();
+
+    const large_size = 20 * 1024 * 1024;
+    const big_msg = try allocator.alloc(u8, large_size);
+    defer allocator.free(big_msg);
+    // Fill with pattern
+    for (big_msg, 0..) |*b, i| b.* = @intCast(i % 255);
+
+    var compressed_out: std.Io.Writer.Allocating = .init(allocator);
+    defer compressed_out.deinit();
+
+    var in_stream: std.Io.Reader = .fixed(big_msg);
+    try zs.compress(&in_stream, &compressed_out.writer);
+
+    std.debug.print("Zstd Compressed size: {d}\n", .{compressed_out.written().len});
+
+    var decompressed_out: std.Io.Writer.Allocating = .init(allocator);
+    defer decompressed_out.deinit();
+
+    var comp_stream: std.Io.Reader = .fixed(compressed_out.written());
+    try zs.decompress(&comp_stream, &decompressed_out.writer);
+
+    try std.testing.expectEqual(big_msg.len, decompressed_out.written().len);
+    try std.testing.expectEqualSlices(u8, big_msg, decompressed_out.written());
+}

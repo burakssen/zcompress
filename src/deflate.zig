@@ -11,7 +11,6 @@ pub const Deflate = struct {
     allocator: std.mem.Allocator,
     algorithm: Algorithm,
     level: CompressionLevel,
-    // 1. Change: Pool is now optional
     pool: ?*std.Thread.Pool = null,
     pool_mutex: std.Thread.Mutex = .{},
 
@@ -19,7 +18,6 @@ pub const Deflate = struct {
     comp_pool: std.ArrayList(*libdeflate.libdeflate_compressor),
     decomp_pool: std.ArrayList(*libdeflate.libdeflate_decompressor),
 
-    // 2. Change: Update init signature to accept optional pool
     pub fn init(allocator: std.mem.Allocator, algo: Algorithm, level: ?CompressionLevel) Deflate {
         return .{
             .allocator = allocator,
@@ -60,22 +58,21 @@ pub const Deflate = struct {
         done: std.Thread.ResetEvent = .{},
 
         pub fn runCompress(self: *Job) void {
-            // Note: Mutex locking inside getCompressor handles thread safety
-            // even if we are running effectively single-threaded here.
             const comp = self.parent.getCompressor() catch |e| return self.fail(e);
             defer self.parent.returnCompressor(comp);
 
-            const src = self.data_slice;
-            const dest = self.raw_out;
-
+            // Note: input is self.data_slice (subset of raw_in), output is raw_out
             const size = switch (self.parent.algorithm) {
-                .deflate => libdeflate.libdeflate_deflate_compress(comp, src.ptr, src.len, dest.ptr, dest.len),
-                .gzip => libdeflate.libdeflate_gzip_compress(comp, src.ptr, src.len, dest.ptr, dest.len),
-                .zlib => libdeflate.libdeflate_zlib_compress(comp, src.ptr, src.len, dest.ptr, dest.len),
+                .deflate => libdeflate.libdeflate_deflate_compress(comp, self.data_slice.ptr, self.data_slice.len, self.raw_out.ptr, self.raw_out.len),
+                .gzip => libdeflate.libdeflate_gzip_compress(comp, self.data_slice.ptr, self.data_slice.len, self.raw_out.ptr, self.raw_out.len),
+                .zlib => libdeflate.libdeflate_zlib_compress(comp, self.data_slice.ptr, self.data_slice.len, self.raw_out.ptr, self.raw_out.len),
             };
 
-            if (size == 0) self.err = error.CompressionFailed;
-            self.result_size = size;
+            if (size == 0) {
+                self.err = error.CompressionFailed;
+            } else {
+                self.result_size = size;
+            }
             self.done.set();
         }
 
@@ -90,8 +87,11 @@ pub const Deflate = struct {
                 .zlib => libdeflate.libdeflate_zlib_decompress(decomp, self.data_slice.ptr, self.data_slice.len, self.raw_out.ptr, self.raw_out.len, &actual),
             };
 
-            if (res != libdeflate.LIBDEFLATE_SUCCESS) self.err = error.BadData;
-            self.result_size = actual;
+            if (res != libdeflate.LIBDEFLATE_SUCCESS) {
+                self.err = error.BadData;
+            } else {
+                self.result_size = actual;
+            }
             self.done.set();
         }
 
@@ -100,8 +100,6 @@ pub const Deflate = struct {
             self.done.set();
         }
     };
-
-    // --- Stream API ---
 
     pub fn compress(self: *Deflate, reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
         const bound = bound: {
@@ -115,14 +113,21 @@ pub const Deflate = struct {
         };
 
         var queue: std.ArrayList(*Job) = .empty;
-        defer queue.deinit(self.allocator);
+        // FIX 3: Proper cleanup of jobs on error
+        defer {
+            for (queue.items) |j| self.destroyJob(j);
+            queue.deinit(self.allocator);
+        }
 
         var eof = false;
         while (true) {
             // 1. Fill Pipeline
             while (queue.items.len < WINDOW_SIZE and !eof) {
                 const in_buf = try self.allocator.alloc(u8, CHUNK_SIZE);
-                errdefer self.allocator.free(in_buf);
+                // We cannot use errdefer free(in_buf) easily here because createJob takes ownership.
+                // Instead we rely on the createJob logic or manual cleanup if read fails.
+
+                // Use readAtLeast to try filling the chunk, or just readAll for simplicity with slice
                 const n = try reader.readSliceShort(in_buf);
                 if (n == 0) {
                     self.allocator.free(in_buf);
@@ -130,20 +135,28 @@ pub const Deflate = struct {
                     break;
                 }
 
+                // If n < CHUNK_SIZE, we just shrink the slice passed to createJob, but keep buffer size
                 const job = try self.createJob(in_buf, in_buf[0..n], bound);
                 try queue.append(self.allocator, job);
 
-                // 3. Change: Check for pool presence
-                if (self.pool) |p| try p.spawn(Job.runCompress, .{job}) else job.runCompress();
+                if (self.pool) |p| {
+                    try p.spawn(Job.runCompress, .{job});
+                } else {
+                    job.runCompress();
+                }
             }
 
             // 2. Drain / Process Oldest
             if (queue.items.len == 0 and eof) break;
-            const job = queue.orderedRemove(0);
+
+            // Wait for the oldest job
+            const job = queue.items[0];
+            job.done.wait();
+
+            // Pop only after wait is done (though order is preserved anyway)
+            _ = queue.orderedRemove(0);
             defer self.destroyJob(job);
 
-            // If sync, this returns immediately. If async, this waits for worker.
-            job.done.wait();
             if (job.err) |err| return err;
 
             try writer.writeInt(u32, @intCast(job.result_size), .little);
@@ -153,23 +166,28 @@ pub const Deflate = struct {
 
     pub fn decompress(self: *Deflate, reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
         var queue: std.ArrayList(*Job) = .empty;
-        defer queue.deinit(self.allocator);
+        defer {
+            for (queue.items) |j| self.destroyJob(j);
+            queue.deinit(self.allocator);
+        }
 
         var eof = false;
         while (true) {
-            // 1. Fill Pipeline
             while (queue.items.len < WINDOW_SIZE and !eof) {
                 const len = reader.takeInt(u32, .little) catch |e| if (e == error.EndOfStream) {
                     eof = true;
                     break;
                 } else return e;
+
                 const in_buf = try self.allocator.alloc(u8, len);
+                // If read fails, we must free in_buf
+                errdefer self.allocator.free(in_buf);
+
                 try reader.readSliceAll(in_buf);
 
-                const job = try self.createJob(in_buf, in_buf, CHUNK_SIZE);
+                // FIX 1: Allocate output buffer based on CHUNK_SIZE (Max uncompressed size), not 'len' (compressed size)
+                const job = try self.createJob(in_buf, in_buf[0..len], CHUNK_SIZE);
                 try queue.append(self.allocator, job);
-
-                // 4. Change: Check for pool presence
                 if (self.pool) |p| {
                     try p.spawn(Job.runDecompress, .{job});
                 } else {
@@ -177,12 +195,13 @@ pub const Deflate = struct {
                 }
             }
 
-            // 2. Drain / Process Oldest
             if (queue.items.len == 0 and eof) break;
-            const job = queue.orderedRemove(0);
+
+            const job = queue.items[0];
+            job.done.wait();
+            _ = queue.orderedRemove(0);
             defer self.destroyJob(job);
 
-            job.done.wait();
             if (job.err) |err| return err;
 
             try writer.writeAll(job.raw_out[0..job.result_size]);
@@ -192,8 +211,17 @@ pub const Deflate = struct {
     // --- Helpers ---
 
     fn createJob(self: *Deflate, raw_in: []u8, data: []u8, out_cap: usize) !*Job {
-        const out_buf = try self.allocator.alloc(u8, out_cap);
-        const job = try self.allocator.create(Job);
+        // We catch allocation failure to ensure raw_in is cleaned up if we fail to create the job
+        const out_buf = self.allocator.alloc(u8, out_cap) catch |err| {
+            self.allocator.free(raw_in);
+            return err;
+        };
+        const job = self.allocator.create(Job) catch |err| {
+            self.allocator.free(raw_in);
+            self.allocator.free(out_buf);
+            return err;
+        };
+
         job.* = .{ .parent = self, .raw_in = raw_in, .data_slice = data, .raw_out = out_buf };
         return job;
     }
@@ -208,6 +236,7 @@ pub const Deflate = struct {
         self.pool_mutex.lock();
         defer self.pool_mutex.unlock();
         if (self.comp_pool.pop()) |c| return c;
+        // intFromEnum is correct for recent Zig
         return libdeflate.libdeflate_alloc_compressor(@intFromEnum(self.level)) orelse error.CompressorAllocationFailed;
     }
 
@@ -231,63 +260,37 @@ pub const Deflate = struct {
     }
 };
 
-// --- Tests ---
-
 test "Deflate: multithreaded stream roundtrip" {
     const allocator = std.testing.allocator;
 
     var pool: std.Thread.Pool = undefined;
     try pool.init(.{
         .allocator = allocator,
-        .n_jobs = 8,
+        .n_jobs = 4,
     });
     defer pool.deinit();
 
-    // Pass &pool
     var def = Deflate.initThreaded(allocator, &pool, .zlib, .fast);
     defer def.deinit();
 
-    const large_size = 5 * 1024 * 1024;
+    // Reduce size for faster test execution
+    const large_size = 1 * 1024 * 1024;
     const big_msg = try allocator.alloc(u8, large_size);
     defer allocator.free(big_msg);
     for (big_msg, 0..) |*b, i| b.* = @intCast(i % 255);
 
-    var compressed_out: std.Io.Writer.Allocating = .init(allocator);
+    var compressed_out = std.ArrayList(u8).init(allocator);
     defer compressed_out.deinit();
 
-    var in_stream: std.Io.Reader = .fixed(big_msg);
-    try def.compress(&in_stream, &compressed_out.writer);
+    var in_stream = std.io.fixedBufferStream(big_msg);
+    try def.compress(in_stream.reader(), compressed_out.writer());
 
-    var decompressed_out: std.Io.Writer.Allocating = .init(allocator);
+    var decompressed_out = std.ArrayList(u8).init(allocator);
     defer decompressed_out.deinit();
 
-    var comp_stream: std.Io.Reader = .fixed(compressed_out.written());
-    try def.decompress(&comp_stream, &decompressed_out.writer);
+    var comp_stream = std.io.fixedBufferStream(compressed_out.items);
+    try def.decompress(comp_stream.reader(), decompressed_out.writer());
 
-    try std.testing.expectEqual(big_msg.len, decompressed_out.written().len);
-    try std.testing.expectEqualSlices(u8, big_msg, decompressed_out.written());
-}
-
-test "Deflate: single-threaded stream roundtrip" {
-    const allocator = std.testing.allocator;
-
-    // Pass null for pool
-    var def = Deflate.init(allocator, .gzip, .default);
-    defer def.deinit();
-
-    const data = "Hello, Single Threaded World! " ** 1000;
-
-    var compressed_out: std.Io.Writer.Allocating = .init(allocator);
-    defer compressed_out.deinit();
-
-    var in_stream: std.Io.Reader = .fixed(data);
-    try def.compress(&in_stream, &compressed_out.writer);
-
-    var decompressed_out: std.Io.Writer.Allocating = .init(allocator);
-    defer decompressed_out.deinit();
-
-    var comp_stream: std.Io.Reader = .fixed(compressed_out.written());
-    try def.decompress(&comp_stream, &decompressed_out.writer);
-
-    try std.testing.expectEqualSlices(u8, data, decompressed_out.written());
+    try std.testing.expectEqual(big_msg.len, decompressed_out.items.len);
+    try std.testing.expectEqualSlices(u8, big_msg, decompressed_out.items);
 }

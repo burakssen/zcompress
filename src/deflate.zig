@@ -183,10 +183,15 @@ pub const Deflate = struct {
                 // If read fails, we must free in_buf
                 errdefer self.allocator.free(in_buf);
 
-                try reader.readSliceAll(in_buf);
+                const n = try reader.readSliceShort(in_buf);
+                if (n == 0) {
+                    self.allocator.free(in_buf);
+                    eof = true;
+                    break;
+                }
 
                 // FIX 1: Allocate output buffer based on CHUNK_SIZE (Max uncompressed size), not 'len' (compressed size)
-                const job = try self.createJob(in_buf, in_buf[0..len], CHUNK_SIZE);
+                const job = try self.createJob(in_buf, in_buf[0..n], CHUNK_SIZE);
                 try queue.append(self.allocator, job);
                 if (self.pool) |p| {
                     try p.spawn(Job.runDecompress, .{job});

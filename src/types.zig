@@ -20,3 +20,10 @@ pub const CompressionLevel = union(enum) {
 pub const JobConfig = struct {
     level: CompressionLevel,
 };
+
+pub const CompressionType = enum {
+    deflate,
+    gzip,
+    zlib,
+    zstd,
+};

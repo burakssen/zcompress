@@ -4,13 +4,16 @@ const backends = @import("backends/backends.zig");
 const engine = @import("engine.zig");
 const Engine = engine.Engine;
 
-pub const ZCompress = union(enum) {
+pub const ZCompressionLevel = types.CompressionLevel;
+pub const ZCompressionType = types.CompressionType;
+
+pub const ZCompress = union(ZCompressionType) {
     deflate: Engine(backends.Deflate),
     gzip: Engine(backends.Deflate),
     zlib: Engine(backends.Deflate),
     zstd: Engine(backends.Zstd),
 
-    pub fn init(allocator: std.mem.Allocator, mode: enum { deflate, gzip, zlib, zstd }) ZCompress {
+    pub fn init(allocator: std.mem.Allocator, mode: ZCompressionType) ZCompress {
         return switch (mode) {
             .deflate => .{ .deflate = Engine(backends.Deflate).init(allocator, .{ .type = .deflate }) },
             .gzip => .{ .gzip = Engine(backends.Deflate).init(allocator, .{ .type = .gzip }) },

@@ -1,7 +1,6 @@
 const std = @import("std");
+const types = @import("../types.zig");
 pub const libdeflate = @cImport(@cInclude("libdeflate.h"));
-
-pub const CLevel = c_int;
 
 type: enum { deflate, gzip, zlib },
 
@@ -10,9 +9,15 @@ pub const Context = struct {
     decomp: ?*libdeflate.libdeflate_decompressor,
 };
 
-pub fn allocContext(_: @This(), level: CLevel) Context {
+pub fn allocContext(_: @This(), level: types.CompressionLevel) Context {
+    const lvl: c_int = switch (level) {
+        .Default => 6,
+        .Min => 1,
+        .Max => 12,
+        .Level => |l| @intCast(l),
+    };
     return .{
-        .comp = libdeflate.libdeflate_alloc_compressor(level),
+        .comp = libdeflate.libdeflate_alloc_compressor(lvl),
         .decomp = libdeflate.libdeflate_alloc_decompressor(),
     };
 }
@@ -30,8 +35,7 @@ pub fn compressBound(self: @This(), ctx: Context, size: usize) usize {
     };
 }
 
-// FIX: Added `_: CLevel` here to match the generic interface
-pub fn compress(self: @This(), ctx: Context, in: []const u8, out: []u8, _: CLevel) !usize {
+pub fn compress(self: @This(), ctx: Context, in: []const u8, out: []u8, _: types.CompressionLevel) !usize {
     const size = switch (self.type) {
         .deflate => libdeflate.libdeflate_deflate_compress(ctx.comp, in.ptr, in.len, out.ptr, out.len),
         .gzip => libdeflate.libdeflate_gzip_compress(ctx.comp, in.ptr, in.len, out.ptr, out.len),

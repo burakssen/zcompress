@@ -10,6 +10,13 @@ pub const ChunkHeader = packed struct {
     }
 };
 
+pub const CompressionLevel = union(enum) {
+    Default,
+    Min,
+    Max,
+    Level: i32,
+};
+
 pub const JobConfig = struct {
-    level: c_int,
+    level: CompressionLevel,
 };

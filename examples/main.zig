@@ -19,7 +19,7 @@ pub fn main() !void {
     var writer: std.Io.Writer.Allocating = .init(allocator);
     defer writer.deinit();
 
-    try compressor.compress(&reader, &writer.writer, 15);
+    try compressor.compress(&reader, &writer.writer, .{ .Level = 15 });
 
     try writer.writer.flush();
 

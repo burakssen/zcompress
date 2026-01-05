@@ -1,4 +1,5 @@
 const std = @import("std");
+const types = @import("types.zig");
 const backends = @import("backends/backends.zig");
 const engine = @import("engine.zig");
 const Engine = engine.Engine;
@@ -25,13 +26,13 @@ pub const ZCompress = union(enum) {
         }
     }
 
-    pub fn compress(self: *ZCompress, r: anytype, w: anytype, level: c_int) !void {
+    pub fn compress(self: *ZCompress, r: *std.Io.Reader, w: *std.Io.Writer, level: types.CompressionLevel) !void {
         switch (self.*) {
             inline else => |*impl| try impl.compress(r, w, level),
         }
     }
 
-    pub fn decompress(self: *ZCompress, r: anytype, w: anytype) !void {
+    pub fn decompress(self: *ZCompress, r: *std.Io.Reader, w: *std.Io.Writer) !void {
         switch (self.*) {
             inline else => |*impl| try impl.decompress(r, w),
         }

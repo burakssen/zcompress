@@ -46,7 +46,7 @@ pub fn Engine(comptime Backend: type) type {
             };
         }
 
-        pub fn compress(self: *Self, reader: anytype, writer: anytype, level: c_int) !void {
+        pub fn compress(self: *Self, reader: *std.Io.Reader, writer: *std.Io.Writer, level: types.CompressionLevel) !void {
             var chunks: std.ArrayList([]u8) = .empty;
             defer {
                 for (chunks.items) |c| self.allocator.free(c);
@@ -114,7 +114,7 @@ pub fn Engine(comptime Backend: type) type {
             try writeHeader(writer, types.ChunkHeader.end());
         }
 
-        pub fn decompress(self: *Self, reader: anytype, writer: anytype) !void {
+        pub fn decompress(self: *Self, reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
             var input_data: std.ArrayList([]u8) = .empty;
             defer {
                 for (input_data.items) |b| self.allocator.free(b);
@@ -162,9 +162,9 @@ pub fn Engine(comptime Backend: type) type {
                 jobs[i] = .{
                     .in = input_data.items[i],
                     .out = out_bufs[i],
-                    .ctx = self.backend.allocContext(0), // Level 0 for decomp
+                    .ctx = self.backend.allocContext(.Default), // Level 0 for decomp
                     .backend = self.backend,
-                    .config = .{ .level = 0 },
+                    .config = .{ .level = .Default },
                 };
                 try pool.spawn(Job.runDecompress, .{&jobs[i]});
             }

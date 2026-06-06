@@ -55,10 +55,6 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-## Compatibility
-
-This is a new v1 container format. Streams written by older experimental versions of `zcompress` are not supported.
-
 ## Building
 
 ```sh

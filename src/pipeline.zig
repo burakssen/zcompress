@@ -27,52 +27,52 @@ pub fn Engine(comptime Backend: type) type {
             in_queue: *ChunkQueue,
             out_queue: *ChunkQueue,
             direction: Direction,
-            level: options.CompressionLevel,
 
             fn worker(self: *Pipeline) anyerror!void {
                 switch (self.direction) {
                     .compress => {
-                        const ctx = try self.backend.allocCompressContext(self.level);
+                        const ctx = try self.backend.allocCompressContext();
                         defer self.backend.freeCompressContext(ctx);
-                        try self.workerLoop(ctx);
-                    },
-                    .decompress => {
-                        const ctx = try self.backend.allocDecompressContext();
-                        defer self.backend.freeDecompressContext(ctx);
-                        try self.workerLoop(ctx);
-                    },
-                }
-            }
+                        while (true) {
+                            const chunk = self.in_queue.getOne(self.io) catch |err| switch (err) {
+                                error.Closed => return,
+                                else => return err,
+                            };
 
-            fn workerLoop(self: *Pipeline, ctx: anytype) anyerror!void {
-                while (true) {
-                    const chunk = self.in_queue.getOne(self.io) catch |err| switch (err) {
-                        error.Closed => return,
-                        else => return err,
-                    };
-
-                    switch (self.direction) {
-                        .compress => {
-                            const written = self.backend.compress(ctx, chunk.input, chunk.output, self.level) catch |err| {
+                            const written = self.backend.compress(ctx, chunk.input, chunk.output) catch |err| {
                                 self.in_queue.close(self.io);
                                 destroyChunk(self.allocator, chunk);
                                 return err;
                             };
                             chunk.header.compressed_size = @intCast(written);
-                        },
-                        .decompress => {
+
+                            self.out_queue.putOne(self.io, chunk) catch |err| {
+                                destroyChunk(self.allocator, chunk);
+                                return err;
+                            };
+                        }
+                    },
+                    .decompress => {
+                        const ctx = try self.backend.allocDecompressContext();
+                        defer self.backend.freeDecompressContext(ctx);
+                        while (true) {
+                            const chunk = self.in_queue.getOne(self.io) catch |err| switch (err) {
+                                error.Closed => return,
+                                else => return err,
+                            };
+
                             self.backend.decompress(ctx, chunk.input, chunk.output) catch |err| {
                                 self.in_queue.close(self.io);
                                 destroyChunk(self.allocator, chunk);
                                 return err;
                             };
-                        },
-                    }
 
-                    self.out_queue.putOne(self.io, chunk) catch |err| {
-                        destroyChunk(self.allocator, chunk);
-                        return err;
-                    };
+                            self.out_queue.putOne(self.io, chunk) catch |err| {
+                                destroyChunk(self.allocator, chunk);
+                                return err;
+                            };
+                        }
+                    },
                 }
             }
         };
@@ -81,15 +81,13 @@ pub fn Engine(comptime Backend: type) type {
         backend: Backend,
         threads: usize,
         chunk_size: usize,
-        level: options.CompressionLevel,
 
-        pub fn init(allocator: std.mem.Allocator, backend: Backend, threads: usize, chunk_size: usize, level: options.CompressionLevel) Self {
+        pub fn init(allocator: std.mem.Allocator, backend: Backend, threads: usize, chunk_size: usize) Self {
             return .{
                 .allocator = allocator,
                 .backend = backend,
                 .threads = @max(1, threads),
                 .chunk_size = chunk_size,
-                .level = level,
             };
         }
 
@@ -112,7 +110,6 @@ pub fn Engine(comptime Backend: type) type {
                 .in_queue = &in_queue,
                 .out_queue = &out_queue,
                 .direction = .compress,
-                .level = self.level,
             };
 
             var worker_futures = try self.allocator.alloc(VoidFuture, self.threads);
@@ -181,7 +178,6 @@ pub fn Engine(comptime Backend: type) type {
                 .in_queue = &in_queue,
                 .out_queue = &out_queue,
                 .direction = .decompress,
-                .level = self.level,
             };
 
             var worker_futures = try self.allocator.alloc(VoidFuture, self.threads);
@@ -230,7 +226,7 @@ pub fn Engine(comptime Backend: type) type {
             defer p.in_queue.close(p.io);
 
             var sequence: u64 = 0;
-            const tmp_ctx = try p.backend.allocCompressContext(s.level);
+            const tmp_ctx = try p.backend.allocCompressContext();
             defer p.backend.freeCompressContext(tmp_ctx);
             const max_output = p.backend.compressBound(tmp_ctx, s.chunk_size);
 

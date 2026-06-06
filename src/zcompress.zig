@@ -26,10 +26,10 @@ pub fn compress(
     });
 
     const chunk_count = switch (normalized.algorithm) {
-        .deflate => try compressWith(backends.Deflate, backends.Deflate.init(.deflate), io, allocator, reader, writer, normalized),
-        .gzip => try compressWith(backends.Deflate, backends.Deflate.init(.gzip), io, allocator, reader, writer, normalized),
-        .zlib => try compressWith(backends.Deflate, backends.Deflate.init(.zlib), io, allocator, reader, writer, normalized),
-        .zstd => try compressWith(backends.Zstd, .{}, io, allocator, reader, writer, normalized),
+        .deflate => try compressWith(backends.Deflate, backends.Deflate.init(.deflate, normalized.level), io, allocator, reader, writer, normalized),
+        .gzip => try compressWith(backends.Deflate, backends.Deflate.init(.gzip, normalized.level), io, allocator, reader, writer, normalized),
+        .zlib => try compressWith(backends.Deflate, backends.Deflate.init(.zlib, normalized.level), io, allocator, reader, writer, normalized),
+        .zstd => try compressWith(backends.Zstd, backends.Zstd.init(normalized.level), io, allocator, reader, writer, normalized),
     };
 
     try format.writeChunkHeader(writer, format.ChunkHeader.end(chunk_count));
@@ -46,10 +46,10 @@ pub fn decompress(
     const header = try format.readHeader(reader, normalized.limits);
 
     switch (header.algorithm) {
-        .deflate => try decompressWith(backends.Deflate, backends.Deflate.init(.deflate), io, allocator, reader, writer, normalized, header),
-        .gzip => try decompressWith(backends.Deflate, backends.Deflate.init(.gzip), io, allocator, reader, writer, normalized, header),
-        .zlib => try decompressWith(backends.Deflate, backends.Deflate.init(.zlib), io, allocator, reader, writer, normalized, header),
-        .zstd => try decompressWith(backends.Zstd, .{}, io, allocator, reader, writer, normalized, header),
+        .deflate => try decompressWith(backends.Deflate, backends.Deflate.init(.deflate, .default), io, allocator, reader, writer, normalized, header),
+        .gzip => try decompressWith(backends.Deflate, backends.Deflate.init(.gzip, .default), io, allocator, reader, writer, normalized, header),
+        .zlib => try decompressWith(backends.Deflate, backends.Deflate.init(.zlib, .default), io, allocator, reader, writer, normalized, header),
+        .zstd => try decompressWith(backends.Zstd, backends.Zstd.init(.default), io, allocator, reader, writer, normalized, header),
     }
 }
 
@@ -62,7 +62,7 @@ fn compressWith(
     writer: *std.Io.Writer,
     opts: Options,
 ) !u64 {
-    var engine = pipeline.Engine(Backend).init(allocator, backend, opts.threads, opts.chunk_size, opts.level);
+    var engine = pipeline.Engine(Backend).init(allocator, backend, opts.threads, opts.chunk_size);
     return try engine.compress(io, reader, writer);
 }
 
@@ -76,7 +76,7 @@ fn decompressWith(
     opts: DecompressOptions,
     header: format.Header,
 ) !void {
-    var engine = pipeline.Engine(Backend).init(allocator, backend, opts.threads, header.chunk_size, .default);
+    var engine = pipeline.Engine(Backend).init(allocator, backend, opts.threads, header.chunk_size);
     try engine.decompress(io, reader, writer, opts.limits);
 }
 

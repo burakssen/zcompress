@@ -1,6 +1,8 @@
 const types = @import("../options.zig");
 const zstd = @cImport(@cInclude("zstd.h"));
 
+level: types.CompressionLevel,
+
 pub const CompressContext = struct {
     ptr: *zstd.ZSTD_CCtx,
 };
@@ -9,7 +11,11 @@ pub const DecompressContext = struct {
     ptr: *zstd.ZSTD_DCtx,
 };
 
-pub fn allocCompressContext(_: @This(), _: types.CompressionLevel) !CompressContext {
+pub fn init(level: types.CompressionLevel) @This() {
+    return .{ .level = level };
+}
+
+pub fn allocCompressContext(_: @This()) !CompressContext {
     const ptr = zstd.ZSTD_createCCtx() orelse return error.OutOfMemory;
     return .{ .ptr = ptr };
 }
@@ -31,8 +37,8 @@ pub fn compressBound(_: @This(), _: CompressContext, size: usize) usize {
     return zstd.ZSTD_compressBound(size);
 }
 
-pub fn compress(_: @This(), ctx: CompressContext, input: []const u8, output: []u8, level: types.CompressionLevel) !usize {
-    const lvl: c_int = switch (level) {
+pub fn compress(self: @This(), ctx: CompressContext, input: []const u8, output: []u8) !usize {
+    const lvl: c_int = switch (self.level) {
         .default => 3,
         .min => zstd.ZSTD_minCLevel(),
         .max => zstd.ZSTD_maxCLevel(),

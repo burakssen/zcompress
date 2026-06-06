@@ -2,6 +2,7 @@ const types = @import("../options.zig");
 pub const libdeflate = @cImport(@cInclude("libdeflate.h"));
 
 kind: Kind,
+level: types.CompressionLevel,
 
 pub const Kind = enum {
     deflate,
@@ -17,12 +18,15 @@ pub const DecompressContext = struct {
     ptr: *libdeflate.libdeflate_decompressor,
 };
 
-pub fn init(kind: Kind) @This() {
-    return .{ .kind = kind };
+pub fn init(kind: Kind, level: types.CompressionLevel) @This() {
+    return .{
+        .kind = kind,
+        .level = level,
+    };
 }
 
-pub fn allocCompressContext(_: @This(), level: types.CompressionLevel) !CompressContext {
-    const lvl: c_int = switch (level) {
+pub fn allocCompressContext(self: @This()) !CompressContext {
+    const lvl: c_int = switch (self.level) {
         .default => 6,
         .min => 1,
         .max => 12,
@@ -53,7 +57,7 @@ pub fn compressBound(self: @This(), ctx: CompressContext, size: usize) usize {
     };
 }
 
-pub fn compress(self: @This(), ctx: CompressContext, input: []const u8, output: []u8, _: types.CompressionLevel) !usize {
+pub fn compress(self: @This(), ctx: CompressContext, input: []const u8, output: []u8) !usize {
     const size = switch (self.kind) {
         .deflate => libdeflate.libdeflate_deflate_compress(ctx.ptr, input.ptr, input.len, output.ptr, output.len),
         .gzip => libdeflate.libdeflate_gzip_compress(ctx.ptr, input.ptr, input.len, output.ptr, output.len),

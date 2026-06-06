@@ -1,0 +1,24 @@
+.{
+    .name = .zcompress,
+    .version = "0.1.0",
+    .fingerprint = 0xaf9251952ddddc44, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .libdeflate = .{
+            .url = "git+https://github.com/burakssen/libdeflate#e2d3bc73988a2539906354821b7c8a3500f42926",
+            .hash = "libdeflate-0.1.0-hwiIxiIWAACsZ2Mgru1ppNwR3z1VF-7IZYqQH-Px2egU",
+        },
+        .zstd = .{
+            .url = "git+https://github.com/allyourcodebase/zstd.git#4ccb01e6fceae86fb9fe36c60b8a103cdc058155",
+            .hash = "zstd-1.5.7-2-KEItkAMwAADNhCbGaImKrjXjnSA51jcqEbGCA3RasVZ9",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "examples",
+        "src",
+        "README.md",
+        "LICENCE",
+    },
+}

@@ -5,7 +5,6 @@ const options = @import("options.zig");
 pub fn Engine(comptime Backend: type) type {
     return struct {
         const Self = @This();
-        const Context = Backend.Context;
 
         const Direction = enum { compress, decompress };
 
@@ -31,9 +30,21 @@ pub fn Engine(comptime Backend: type) type {
             level: options.CompressionLevel,
 
             fn worker(self: *Pipeline) anyerror!void {
-                const ctx = try self.backend.allocContext(self.level);
-                defer Backend.freeContext(ctx);
+                switch (self.direction) {
+                    .compress => {
+                        const ctx = try self.backend.allocCompressContext(self.level);
+                        defer self.backend.freeCompressContext(ctx);
+                        try self.workerLoop(ctx);
+                    },
+                    .decompress => {
+                        const ctx = try self.backend.allocDecompressContext();
+                        defer self.backend.freeDecompressContext(ctx);
+                        try self.workerLoop(ctx);
+                    },
+                }
+            }
 
+            fn workerLoop(self: *Pipeline, ctx: anytype) anyerror!void {
                 while (true) {
                     const chunk = self.in_queue.getOne(self.io) catch |err| switch (err) {
                         error.Closed => return,
@@ -219,8 +230,8 @@ pub fn Engine(comptime Backend: type) type {
             defer p.in_queue.close(p.io);
 
             var sequence: u64 = 0;
-            const tmp_ctx = try p.backend.allocContext(s.level);
-            defer Backend.freeContext(tmp_ctx);
+            const tmp_ctx = try p.backend.allocCompressContext(s.level);
+            defer p.backend.freeCompressContext(tmp_ctx);
             const max_output = p.backend.compressBound(tmp_ctx, s.chunk_size);
 
             while (true) {
